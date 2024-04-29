@@ -39,25 +39,27 @@ class VarifocalLoss(nn.Module):
 class FocalLoss(nn.Module):
     """Wraps focal loss around existing loss_fcn(), i.e. criteria = FocalLoss(nn.BCEWithLogitsLoss(), gamma=1.5)."""
 
-    def __init__(self):
+    def __init__(self, gamma=1.5, alpha=0.25):
         """Initializer for FocalLoss class with no parameters."""
         super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
 
     @staticmethod
-    def forward(pred, label, gamma=1.5, alpha=0.25):
+    def forward(self, pred, label, gamma=1.5, alpha=0.25):
         """Calculates and updates confusion matrix for object detection/classification tasks."""
         loss = F.binary_cross_entropy_with_logits(pred, label, reduction="none")
-        # p_t = torch.exp(-loss)
-        # loss *= self.alpha * (1.000001 - p_t) ** self.gamma  # non-zero power for gradient stability
+        pred_prob = pred.sigmoid()
+        p_t = label * pred_prob + (1 - label) * (1- pred_prob)
+        modulating_factor = (1.0 - p_t) ** self.gamma
+        alpha_factor = label * self.alpha + (1 - label) * (1 - self.alpha)
+        loss *= modulating_factor * alpha_factor  # non-zero power for gradient stability
 
         # TF implementation https://github.com/tensorflow/addons/blob/v0.7.1/tensorflow_addons/losses/focal_loss.py
-        pred_prob = pred.sigmoid()  # prob from logits
-        p_t = label * pred_prob + (1 - label) * (1 - pred_prob)
-        modulating_factor = (1.0 - p_t) ** gamma
-        loss *= modulating_factor
-        if alpha > 0:
-            alpha_factor = label * alpha + (1 - label) * (1 - alpha)
-            loss *= alpha_factor
+        if class_weights is not None:
+            class_weights = class_weights.to(pred.device)
+            loss *= class_weights[label.long()]
+            
         return loss.mean(1).sum()
 
 
@@ -70,12 +72,12 @@ class BboxLoss(nn.Module):
         self.reg_max = reg_max
         self.use_dfl = use_dfl
 
-    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask):
+    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask, class_weights):
         """IoU loss."""
-        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1) * class_weights
         iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
-
+        loss_dfl = torch.tensor(0.0).to(pred_dist.device)
         # DFL loss
         if self.use_dfl:
             target_ltrb = bbox2dist(anchor_points, target_bboxes, self.reg_max)
